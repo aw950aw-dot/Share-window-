@@ -25,6 +25,8 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("smartshare", MODE_PRIVATE) }
     private var overlayView: View? = null
+    private var overlayListContainer: LinearLayout? = null
+    private var overlaySubtitleView: TextView? = null
     private var lastCandidates: List<String> = emptyList()
     private var showHiddenList = false
     private var secretPresses = 0
@@ -57,13 +59,18 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 .apply()
             handler.removeCallbacks(hideRunnable)
             handler.removeCallbacks(scanRunnable)
-            if (prefs.getBoolean("overlay_enabled", true)) {
-                if (overlayView == null) showOverlay(emptyList(), loading = true)
-            } else {
+
+            // Do not cover file-upload pickers: first inspect the chooser's visible content.
+            val initialRoot = findChooserRoot()
+            val initialVerdict = initialRoot?.let { classifyShareChooser(it) }
+            if (initialVerdict == "share" && prefs.getBoolean("overlay_enabled", true)) {
+                showOverlay(emptyList(), loading = true)
+            } else if (!prefs.getBoolean("overlay_enabled", true)) {
                 removeOverlay()
             }
-            // Put the opaque cover on screen first; scan the chooser after the first frame.
-            handler.postDelayed(scanRunnable, 35)
+
+            // If the view tree is not ready yet, a later content-change event will retry.
+            handler.postDelayed(scanRunnable, if (initialRoot != null) 35 else 80)
             return
         }
 
@@ -98,11 +105,24 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         if (!chooserExpected) return
         val root = findChooserRoot()
         if (root == null) {
-            val message = "ChooserActivity זוהתה, אבל שירות הנגישות לא קיבל root לחלון android."
-            prefs.edit().putString("last_tree", message).apply()
-            if (prefs.getBoolean("overlay_enabled", true)) {
-                showOverlay(emptyList(), unavailable = true)
+            prefs.edit().putString(
+                "last_tree",
+                "ChooserActivity זוהתה, אך שירות הנגישות עדיין לא קיבל עץ חלון. הבדיקה תנסה שוב באירוע התוכן הבא."
+            ).apply()
+            return
+        }
+
+        val verdict = classifyShareChooser(root)
+        if (verdict != "share") {
+            // Fail closed: an uncertain chooser is left untouched, especially file-upload flows.
+            chooserExpected = false
+            removeOverlay()
+            val reason = if (verdict == "file-picker") {
+                "החלון זוהה כמסך בחירת קובץ/העלאה; SmartShare לא הוצגה."
+            } else {
+                "לא נמצאו סימנים ברורים למסך שיתוף; SmartShare לא הוצגה כדי לא להפריע להעלאת קבצים."
             }
+            prefs.edit().putString("last_tree", reason).apply()
             return
         }
 
@@ -116,7 +136,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             .putStringSet("last_candidates", lastCandidates.toSet())
             .putString(
                 "last_tree",
-                "חלון: ${root.className}\nחבילה: ${root.packageName}\nצמתים שנבדקו: ${counter[0]}\nיעדים/פעולות לחיצים: ${lastCandidates.size}\n\n" +
+                "סיווג: מסך שיתוף\nחלון: ${root.className}\nחבילה: ${root.packageName}\nצמתים שנבדקו: ${counter[0]}\nיעדים/פעולות לחיצים: ${lastCandidates.size}\n\n" +
                     treeLines.joinToString("\n")
             )
             .apply()
@@ -126,6 +146,48 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         } else {
             removeOverlay()
         }
+    }
+
+    /**
+     * Accessibility does not expose the launching Intent/action to this service.
+     * Use visible chooser labels to positively identify a share sheet and reject
+     * recognizable document/file-picker screens. Unknown layouts are ignored.
+     */
+    private fun classifyShareChooser(root: AccessibilityNodeInfo): String {
+        val text = StringBuilder()
+        val visited = intArrayOf(0)
+
+        fun collect(node: AccessibilityNodeInfo, depth: Int) {
+            if (visited[0] >= 180 || depth > 18) return
+            visited[0]++
+            if (node.isVisibleToUser) {
+                node.text?.toString()?.let { text.append(' ').append(it) }
+                node.contentDescription?.toString()?.let { text.append(' ').append(it) }
+                node.viewIdResourceName?.let { text.append(' ').append(it) }
+            }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                collect(child, depth + 1)
+            }
+        }
+        collect(root, 0)
+
+        val value = text.toString().lowercase(java.util.Locale.ROOT)
+        val filePickerSignals = listOf(
+            "choose a file", "select a file", "select files", "choose file",
+            "browse files", "file picker", "upload a file", "choose photos",
+            "select photos", "photos picker", "recent files", "open from",
+            "בחירת קובץ", "בחר קובץ", "בחר קבצים", "בחירת תמונות",
+            "בחר תמונות", "העלאת קובץ", "העלאת קבצים", "עיון בקבצים",
+            "קבצים אחרונים", "מסמכים אחרונים"
+        )
+        if (filePickerSignals.any { value.contains(it) }) return "file-picker"
+
+        val shareSignals = listOf(
+            "sharing", "share with", "share", "nearby share", "quick share",
+            "send to", "שיתוף", "שתף", "לשתף", "שליחה", "שלח אל"
+        )
+        return if (shareSignals.any { value.contains(it) }) "share" else "unknown"
     }
 
     private fun findChooserRoot(): AccessibilityNodeInfo? {
@@ -190,68 +252,141 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         unavailable: Boolean = false
     ) {
         lastCandidates = candidates
-        removeOverlay()
 
-        val screen = FrameLayout(this).apply {
-            // Opaque background prevents the native chooser from showing through.
-            setBackgroundColor(Color.rgb(245, 247, 251))
-            isClickable = true
-            isFocusable = false
-        }
-
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(18), dp(18), dp(18), dp(16))
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(250, 251, 254))
-                cornerRadius = dp(22).toFloat()
+        // Keep the same accessibility window attached. Replacing it causes the
+        // native Android chooser to flash through for a frame.
+        var screen = overlayView as? FrameLayout
+        var list = overlayListContainer
+        if (screen == null || list == null) {
+            screen = FrameLayout(this).apply {
+                setBackgroundColor(Color.rgb(245, 247, 251))
+                isClickable = true
+                isFocusable = false
             }
-            elevation = dp(12).toFloat()
-        }
 
-        val topRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-        val title = TextView(this).apply {
-            text = "SmartShare"
-            textSize = 23f
-            setTextColor(Color.rgb(27, 42, 69))
-            setTypeface(typeface, Typeface.BOLD)
-            gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
-            setOnLongClickListener {
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastSecretPressAt > 10_000L) secretPresses = 0
-                lastSecretPressAt = now
-                secretPresses++
-                if (secretPresses >= 4) {
-                    secretPresses = 0
-                    showHiddenList = !showHiddenList
-                    Toast.makeText(
-                        this@ShareWindowAccessibilityService,
-                        if (showHiddenList) "הרשימה המלאה נפתחה" else "חזרה לרשימה המצומצמת",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    showOverlay(lastCandidates)
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(18), dp(18), dp(18), dp(16))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(250, 251, 254))
+                    cornerRadius = dp(22).toFloat()
                 }
-                true
+                elevation = dp(12).toFloat()
+            }
+
+            val topRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            val title = TextView(this).apply {
+                text = "SmartShare"
+                textSize = 23f
+                setTextColor(Color.rgb(27, 42, 69))
+                setTypeface(typeface, Typeface.BOLD)
+                gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
+                setOnLongClickListener {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastSecretPressAt > 10_000L) secretPresses = 0
+                    lastSecretPressAt = now
+                    secretPresses++
+                    if (secretPresses >= 4) {
+                        secretPresses = 0
+                        showHiddenList = !showHiddenList
+                        Toast.makeText(
+                            this@ShareWindowAccessibilityService,
+                            if (showHiddenList) "הרשימה המלאה נפתחה" else "חזרה לרשימה המצומצמת",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        showOverlay(lastCandidates)
+                    }
+                    true
+                }
+            }
+            topRow.addView(title, LinearLayout.LayoutParams(0, dp(46), 1f))
+
+            val close = TextView(this).apply {
+                text = "✕"
+                textSize = 22f
+                setTextColor(Color.DKGRAY)
+                gravity = Gravity.CENTER
+                setPadding(dp(12), 0, dp(4), 0)
+                setOnClickListener { closeChooser() }
+            }
+            topRow.addView(close, LinearLayout.LayoutParams(dp(42), dp(46)))
+            card.addView(topRow)
+
+            val subtitle = TextView(this).apply {
+                textSize = 13f
+                setTextColor(Color.rgb(95, 104, 120))
+                setPadding(0, 0, 0, dp(12))
+            }
+            overlaySubtitleView = subtitle
+            card.addView(subtitle)
+
+            val listScroll = ScrollView(this).apply { isFillViewport = true }
+            list = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+            }
+            listScroll.addView(list)
+            card.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+            val footer = TextView(this).apply {
+                text = "ארבע לחיצות ארוכות על הכותרת פותחות את כל הרשימה"
+                textSize = 11f
+                setTextColor(Color.rgb(110, 118, 132))
+                setPadding(0, dp(10), 0, 0)
+                gravity = Gravity.CENTER
+            }
+            card.addView(footer)
+
+            screen.addView(card, FrameLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            ).apply {
+                setMargins(dp(16), dp(28), dp(16), dp(28))
+            })
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+            }
+
+            try {
+                (getSystemService(WINDOW_SERVICE) as WindowManager).addView(screen, params)
+                overlayView = screen
+                overlayListContainer = list
+            } catch (error: Exception) {
+                prefs.edit().putString(
+                    "last_tree",
+                    (prefs.getString("last_tree", "").orEmpty()) +
+                        "\n\nשגיאה בהצגת שכבת־העל: ${error.javaClass.simpleName}: ${error.message}"
+                ).apply()
+                overlayView = null
+                overlayListContainer = null
+                overlaySubtitleView = null
+                return
             }
         }
-        topRow.addView(title, LinearLayout.LayoutParams(0, dp(46), 1f))
 
-        val close = TextView(this).apply {
-            text = "✕"
-            textSize = 22f
-            setTextColor(Color.DKGRAY)
-            gravity = Gravity.CENTER
-            setPadding(dp(12), 0, dp(4), 0)
-            setOnClickListener { removeOverlay() }
-        }
-        topRow.addView(close, LinearLayout.LayoutParams(dp(42), dp(46)))
-        card.addView(topRow)
+        renderOverlayContents(candidates, loading, unavailable)
+    }
 
+    private fun renderOverlayContents(
+        candidates: List<String>,
+        loading: Boolean,
+        unavailable: Boolean
+    ) {
+        val list = overlayListContainer ?: return
         val filterEnabled = prefs.getBoolean("filter_enabled", false)
         val selected = prefs.getStringSet("selected_targets", emptySet()).orEmpty()
         val visibleCandidates = if (filterEnabled && !showHiddenList) {
@@ -260,24 +395,13 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             candidates
         }
 
-        val subtitle = TextView(this).apply {
-            text = when {
-                showHiddenList -> "מצב נסתר — כל הפריטים שזוהו"
-                filterEnabled -> "הרשימה המצומצמת שלך"
-                else -> "הפריטים שנמצאו בחלון השיתוף"
-            }
-            textSize = 13f
-            setTextColor(Color.rgb(95, 104, 120))
-            setPadding(0, 0, 0, dp(12))
-        }
-        card.addView(subtitle)
-
-        val listScroll = ScrollView(this).apply { isFillViewport = true }
-        val list = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        overlaySubtitleView?.text = when {
+            showHiddenList -> "מצב נסתר — כל הפריטים שזוהו"
+            filterEnabled -> "הרשימה המצומצמת שלך"
+            else -> "הפריטים שנמצאו בחלון השיתוף"
         }
 
+        list.removeAllViews()
         if (visibleCandidates.isEmpty()) {
             val empty = TextView(this).apply {
                 text = when {
@@ -304,50 +428,6 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                     bottomMargin = dp(5)
                 })
             }
-        }
-
-        listScroll.addView(list)
-        card.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        val footer = TextView(this).apply {
-            text = "ארבע לחיצות ארוכות על הכותרת פותחות את כל הרשימה"
-            textSize = 11f
-            setTextColor(Color.rgb(110, 118, 132))
-            setPadding(0, dp(10), 0, 0)
-            gravity = Gravity.CENTER
-        }
-        card.addView(footer)
-
-        screen.addView(card, FrameLayout.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            Gravity.CENTER
-        ).apply {
-            setMargins(dp(16), dp(28), dp(16), dp(28))
-        })
-
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-        }
-
-        try {
-            wm.addView(screen, params)
-            overlayView = screen
-        } catch (error: Exception) {
-            prefs.edit().putString(
-                "last_tree",
-                (prefs.getString("last_tree", "").orEmpty()) +
-                    "\n\nשגיאה בהצגת שכבת־העל: ${error.javaClass.simpleName}: ${error.message}"
-            ).apply()
-            overlayView = null
         }
     }
 
@@ -395,6 +475,19 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun closeChooser() {
+        val shouldGoBack = chooserExpected
+        chooserExpected = false
+        handler.removeCallbacks(scanRunnable)
+        handler.removeCallbacks(hideRunnable)
+        removeOverlay()
+        if (shouldGoBack) {
+            // The accessibility overlay is not the native chooser activity.
+            // Send Back after removing our window so Android dismisses the chooser too.
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+    }
+
     private fun removeOverlay() {
         val view = overlayView ?: return
         try {
@@ -402,6 +495,8 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {
         }
         overlayView = null
+        overlayListContainer = null
+        overlaySubtitleView = null
     }
 
     private fun dp(value: Int): Int =
