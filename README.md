@@ -32,4 +32,4 @@ This build is deliberately a diagnostic prototype for the Fanvace M36 Plus / And
 
 ## Build
 
-The GitHub Actions workflow builds a debug APK on pushes to `main` and on manual dispatch.
+The GitHub Actions workflow builds a debug APK on pushes to `main` and on manual dispatch. Uploaded APK artifacts are retained for 14 days.
