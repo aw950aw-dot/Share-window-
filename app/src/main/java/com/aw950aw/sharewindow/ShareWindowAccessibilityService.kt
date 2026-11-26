@@ -539,18 +539,20 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             try {
                 packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
                     .forEach { info ->
-                        val activityInfo = info.activityInfo ?: return@forEach
-                        val packageName = activityInfo.packageName
-                        if (!byPackage.containsKey(packageName)) {
-                            val appLabel = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
-                            if (appLabel.isNotEmpty()) {
-                                val icon = try {
-                                    info.loadIcon(packageManager)
-                                } catch (_: Exception) {
-                                    null
-                                }
-                                if (icon != null) {
-                                    byPackage[packageName] = ShareAppIcon(appLabel, packageName, icon)
+                        val activityInfo = info.activityInfo
+                        if (activityInfo != null) {
+                            val packageName = activityInfo.packageName
+                            if (!byPackage.containsKey(packageName)) {
+                                val appLabel = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+                                if (appLabel.isNotEmpty()) {
+                                    val icon = try {
+                                        info.loadIcon(packageManager)
+                                    } catch (_: Exception) {
+                                        null
+                                    }
+                                    if (icon != null) {
+                                        byPackage[packageName] = ShareAppIcon(appLabel, packageName, icon)
+                                    }
                                 }
                             }
                         }
