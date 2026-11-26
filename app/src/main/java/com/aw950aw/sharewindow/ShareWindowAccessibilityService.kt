@@ -57,7 +57,13 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 .apply()
             handler.removeCallbacks(hideRunnable)
             handler.removeCallbacks(scanRunnable)
-            handler.postDelayed(scanRunnable, 220)
+            if (prefs.getBoolean("overlay_enabled", true)) {
+                if (overlayView == null) showOverlay(emptyList(), loading = true)
+            } else {
+                removeOverlay()
+            }
+            // Put the opaque cover on screen first; scan the chooser after the first frame.
+            handler.postDelayed(scanRunnable, 35)
             return
         }
 
@@ -74,7 +80,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             eventPackage == "android"
         ) {
             handler.removeCallbacks(scanRunnable)
-            handler.postDelayed(scanRunnable, 450)
+            handler.postDelayed(scanRunnable, 80)
         }
     }
 
@@ -95,7 +101,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             val message = "ChooserActivity זוהתה, אבל שירות הנגישות לא קיבל root לחלון android."
             prefs.edit().putString("last_tree", message).apply()
             if (prefs.getBoolean("overlay_enabled", true)) {
-                showOverlay(emptyList())
+                showOverlay(emptyList(), unavailable = true)
             }
             return
         }
@@ -178,12 +184,17 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun showOverlay(candidates: List<String>) {
+    private fun showOverlay(
+        candidates: List<String>,
+        loading: Boolean = false,
+        unavailable: Boolean = false
+    ) {
         lastCandidates = candidates
         removeOverlay()
 
         val screen = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(205, 8, 14, 28))
+            // Opaque background prevents the native chooser from showing through.
+            setBackgroundColor(Color.rgb(245, 247, 251))
             isClickable = true
             isFocusable = false
         }
@@ -269,10 +280,12 @@ class ShareWindowAccessibilityService : AccessibilityService() {
 
         if (visibleCandidates.isEmpty()) {
             val empty = TextView(this).apply {
-                text = if (filterEnabled && !showHiddenList) {
-                    "לא סומנו יעדים להצגה. אפשר לבחור יעדים במסך ההגדרות או לבצע ארבע לחיצות ארוכות על הכותרת כדי לחשוף את הרשימה המלאה."
-                } else {
-                    "לא זוהו פריטים לחיצים בחלון. חזור למסך האבחון ובדוק את עץ הנגישות."
+                text = when {
+                    loading -> "מכין את רשימת יעדי השיתוף…"
+                    unavailable -> "חלון השיתוף זוהה, אך כרגע Android לא מאפשר לקרוא את רשימת היעדים."
+                    filterEnabled && !showHiddenList ->
+                        "לא סומנו יעדים להצגה. אפשר לבחור יעדים במסך ההגדרות או לבצע ארבע לחיצות ארוכות על הכותרת כדי לחשוף את הרשימה המלאה."
+                    else -> "לא זוהו פריטים לחיצים בחלון. חזור למסך האבחון ובדוק את עץ הנגישות."
                 }
                 textSize = 14f
                 setTextColor(Color.DKGRAY)
