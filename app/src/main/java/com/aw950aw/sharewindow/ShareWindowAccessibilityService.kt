@@ -1,11 +1,14 @@
 package com.aw950aw.sharewindow
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -16,6 +19,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -27,7 +31,9 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private var overlayView: View? = null
     private var overlayListContainer: LinearLayout? = null
     private var overlaySubtitleView: TextView? = null
+    private var cachedShareAppIcons: List<ShareAppIcon>? = null
     private var lastCandidates: List<String> = emptyList()
+    private data class ShareAppIcon(val label: String, val packageName: String, val drawable: Drawable)
     private var showHiddenList = false
     private var secretPresses = 0
     private var lastSecretPressAt = 0L
@@ -63,14 +69,17 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             // Do not cover file-upload pickers: first inspect the chooser's visible content.
             val initialRoot = findChooserRoot()
             val initialVerdict = initialRoot?.let { classifyShareChooser(it) }
-            if (initialVerdict == "share" && prefs.getBoolean("overlay_enabled", true)) {
+            if (initialVerdict != "file-picker" && prefs.getBoolean("overlay_enabled", true)) {
+                // ChooserActivity is the strong signal for ACTION_SEND. Cover immediately,
+                // without waiting for the text tree to finish rendering.
                 showOverlay(emptyList(), loading = true)
-            } else if (!prefs.getBoolean("overlay_enabled", true)) {
+            } else {
+                chooserExpected = false
                 removeOverlay()
             }
 
-            // If the view tree is not ready yet, a later content-change event will retry.
-            handler.postDelayed(scanRunnable, if (initialRoot != null) 35 else 80)
+            // Build the target list only after the native chooser has been covered.
+            handler.postDelayed(scanRunnable, 15)
             return
         }
 
@@ -113,16 +122,13 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         }
 
         val verdict = classifyShareChooser(root)
-        if (verdict != "share") {
-            // Fail closed: an uncertain chooser is left untouched, especially file-upload flows.
+        if (verdict == "file-picker") {
             chooserExpected = false
             removeOverlay()
-            val reason = if (verdict == "file-picker") {
+            prefs.edit().putString(
+                "last_tree",
                 "החלון זוהה כמסך בחירת קובץ/העלאה; SmartShare לא הוצגה."
-            } else {
-                "לא נמצאו סימנים ברורים למסך שיתוף; SmartShare לא הוצגה כדי לא להפריע להעלאת קבצים."
-            }
-            prefs.edit().putString("last_tree", reason).apply()
+            ).apply()
             return
         }
 
@@ -131,7 +137,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         val counter = intArrayOf(0)
         collectTree(root, 0, treeLines, candidates, counter)
 
-        lastCandidates = candidates.toList().sorted()
+        lastCandidates = candidates.toList()
         prefs.edit()
             .putStringSet("last_candidates", lastCandidates.toSet())
             .putString(
@@ -253,27 +259,48 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     ) {
         lastCandidates = candidates
 
-        // Keep the same accessibility window attached. Replacing it causes the
-        // native Android chooser to flash through for a frame.
+        // Keep one attached accessibility window to prevent the native chooser flashing through.
         var screen = overlayView as? FrameLayout
         var list = overlayListContainer
         if (screen == null || list == null) {
             screen = FrameLayout(this).apply {
-                setBackgroundColor(Color.rgb(245, 247, 251))
+                setBackgroundColor(Color.argb(105, 0, 0, 0))
                 isClickable = true
                 isFocusable = false
+                setOnClickListener { closeChooser() }
             }
 
-            val card = LinearLayout(this).apply {
+            val sheetHeight = (resources.displayMetrics.heightPixels - dp(20)).coerceAtLeast(dp(420))
+            val peekHeight = (resources.displayMetrics.heightPixels * 0.70f).toInt().coerceAtMost(sheetHeight)
+            val sheet = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
-                setPadding(dp(18), dp(18), dp(18), dp(16))
+                setPadding(dp(16), dp(7), dp(16), dp(14))
                 background = GradientDrawable().apply {
                     setColor(Color.rgb(250, 251, 254))
-                    cornerRadius = dp(22).toFloat()
+                    cornerRadii = floatArrayOf(
+                        dp(24).toFloat(), dp(24).toFloat(),
+                        dp(24).toFloat(), dp(24).toFloat(),
+                        0f, 0f, 0f, 0f
+                    )
                 }
-                elevation = dp(12).toFloat()
+                elevation = dp(16).toFloat()
             }
+
+            val dragArea = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                isClickable = true
+            }
+            val handle = View(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(185, 190, 199))
+                    cornerRadius = dp(3).toFloat()
+                }
+            }
+            dragArea.addView(handle, LinearLayout.LayoutParams(dp(38), dp(5)))
+            sheet.addView(dragArea, LinearLayout.LayoutParams(-1, dp(28)))
 
             val topRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -282,7 +309,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             }
             val title = TextView(this).apply {
                 text = "SmartShare"
-                textSize = 23f
+                textSize = 21f
                 setTextColor(Color.rgb(27, 42, 69))
                 setTypeface(typeface, Typeface.BOLD)
                 gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
@@ -294,17 +321,12 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                     if (secretPresses >= 4) {
                         secretPresses = 0
                         showHiddenList = !showHiddenList
-                        Toast.makeText(
-                            this@ShareWindowAccessibilityService,
-                            if (showHiddenList) "הרשימה המלאה נפתחה" else "חזרה לרשימה המצומצמת",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                        showOverlay(lastCandidates)
+                        renderOverlayContents(lastCandidates, false, false)
                     }
                     true
                 }
             }
-            topRow.addView(title, LinearLayout.LayoutParams(0, dp(46), 1f))
+            topRow.addView(title, LinearLayout.LayoutParams(0, dp(48), 1f))
 
             val close = TextView(this).apply {
                 text = "✕"
@@ -314,55 +336,81 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 setPadding(dp(12), 0, dp(4), 0)
                 setOnClickListener { closeChooser() }
             }
-            topRow.addView(close, LinearLayout.LayoutParams(dp(42), dp(46)))
-            card.addView(topRow)
+            topRow.addView(close, LinearLayout.LayoutParams(dp(42), dp(48)))
+            sheet.addView(topRow)
 
             val subtitle = TextView(this).apply {
                 textSize = 13f
                 setTextColor(Color.rgb(95, 104, 120))
-                setPadding(0, 0, 0, dp(12))
+                setPadding(dp(2), 0, dp(2), dp(9))
             }
             overlaySubtitleView = subtitle
-            card.addView(subtitle)
+            sheet.addView(subtitle)
 
-            val listScroll = ScrollView(this).apply { isFillViewport = true }
+            val scroll = ScrollView(this).apply { isFillViewport = true }
             list = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
             }
-            listScroll.addView(list)
-            card.addView(listScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+            scroll.addView(list)
+            sheet.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-            val footer = TextView(this).apply {
-                text = "ארבע לחיצות ארוכות על הכותרת פותחות את כל הרשימה"
-                textSize = 11f
-                setTextColor(Color.rgb(110, 118, 132))
-                setPadding(0, dp(10), 0, 0)
-                gravity = Gravity.CENTER
-            }
-            card.addView(footer)
+            val params = FrameLayout.LayoutParams(-1, sheetHeight, Gravity.BOTTOM)
+            screen.addView(sheet, params)
+            sheet.translationY = (sheetHeight - peekHeight).toFloat()
 
-            screen.addView(card, FrameLayout.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                Gravity.CENTER
-            ).apply {
-                setMargins(dp(16), dp(28), dp(16), dp(28))
-            })
-
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
+            var downY = 0f
+            var startTranslation = 0f
+            dragArea.setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        downY = event.rawY
+                        startTranslation = sheet.translationY
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        val dy = event.rawY - downY
+                        val maxDrag = sheetHeight.toFloat()
+                        sheet.translationY = (startTranslation + dy).coerceIn(0f, maxDrag)
+                        true
+                    }
+                    android.view.MotionEvent.ACTION_UP,
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        val dy = event.rawY - downY
+                        val dismissAt = (sheetHeight * 0.78f)
+                        val movedDownFar = sheet.translationY >= dismissAt
+                        when {
+                            movedDownFar -> closeChooser()
+                            dy < -dp(65) -> sheet.animate().translationY(0f).setDuration(180).start()
+                            dy > dp(65) && sheet.translationY > (sheetHeight - peekHeight + dp(100)) ->
+                                closeChooser()
+                            else -> {
+                                val target = if (sheet.translationY < (sheetHeight - peekHeight) / 2f) {
+                                    0f
+                                } else {
+                                    (sheetHeight - peekHeight).toFloat()
+                                }
+                                sheet.animate().translationY(target).setDuration(180).start()
+                            }
+                        }
+                        true
+                    }
+                    else -> true
+                }
             }
 
             try {
-                (getSystemService(WINDOW_SERVICE) as WindowManager).addView(screen, params)
+                val wmParams = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                }
+                (getSystemService(WINDOW_SERVICE) as WindowManager).addView(screen, wmParams)
                 overlayView = screen
                 overlayListContainer = list
             } catch (error: Exception) {
@@ -414,21 +462,103 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 textSize = 14f
                 setTextColor(Color.DKGRAY)
                 setPadding(dp(10), dp(22), dp(10), dp(22))
+                gravity = Gravity.CENTER
             }
             list.addView(empty)
-        } else {
-            visibleCandidates.forEach { label ->
-                val target = Button(this).apply {
-                    text = label
-                    textSize = 14f
-                    isAllCaps = false
-                    setOnClickListener { clickOriginalTarget(label) }
+            return
+        }
+
+        // Native Android sharesheet presents app targets in icon tiles. Preserve
+        // their accessibility-tree order and render four columns per row.
+        var row: LinearLayout? = null
+        visibleCandidates.forEachIndexed { index, label ->
+            if (index % 4 == 0) {
+                row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutDirection = View.LAYOUT_DIRECTION_RTL
+                    gravity = Gravity.TOP
                 }
-                list.addView(target, LinearLayout.LayoutParams(-1, dp(52)).apply {
-                    bottomMargin = dp(5)
-                })
+                list.addView(row, LinearLayout.LayoutParams(-1, dp(112)))
+            }
+
+            val tile = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                isClickable = true
+                isFocusable = true
+                setPadding(dp(3), dp(4), dp(3), dp(4))
+                setOnClickListener { clickOriginalTarget(label) }
+            }
+
+            val icon = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                val drawable = findShareAppIcon(label)
+                    ?: getDrawable(android.R.drawable.sym_def_app_icon)
+                setImageDrawable(drawable)
+            }
+            tile.addView(icon, LinearLayout.LayoutParams(dp(46), dp(46)))
+
+            val caption = TextView(this).apply {
+                text = label
+                textSize = 11f
+                maxLines = 2
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(35, 43, 58))
+                setPadding(0, dp(4), 0, 0)
+            }
+            tile.addView(caption, LinearLayout.LayoutParams(-1, dp(36)))
+
+            row?.addView(tile, LinearLayout.LayoutParams(0, dp(104), 1f))
+        }
+    }
+
+    private fun findShareAppIcon(label: String): Drawable? {
+        val normalized = label.trim().lowercase(java.util.Locale.ROOT)
+        if (normalized.isEmpty()) return null
+        val apps = getShareAppIcons()
+        val exact = apps.firstOrNull {
+            it.label.trim().lowercase(java.util.Locale.ROOT) == normalized
+        }
+        val match = exact ?: apps.firstOrNull {
+            val appLabel = it.label.trim().lowercase(java.util.Locale.ROOT)
+            appLabel.isNotEmpty() &&
+                (normalized.contains(appLabel) || appLabel.contains(normalized))
+        }
+        return match?.drawable
+    }
+
+    private fun getShareAppIcons(): List<ShareAppIcon> {
+        cachedShareAppIcons?.let { return it }
+        val byPackage = LinkedHashMap<String, ShareAppIcon>()
+        val intents = listOf(
+            Intent(Intent.ACTION_SEND).apply { type = "*/*" },
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply { type = "*/*" }
+        )
+        intents.forEach { intent ->
+            try {
+                packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+                    .forEach { info ->
+                        val activityInfo = info.activityInfo ?: return@forEach
+                        val packageName = activityInfo.packageName
+                        if (!byPackage.containsKey(packageName)) {
+                            val appLabel = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+                            if (appLabel.isNotEmpty()) {
+                                val icon = try {
+                                    info.loadIcon(packageManager)
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                if (icon != null) {
+                                    byPackage[packageName] = ShareAppIcon(appLabel, packageName, icon)
+                                }
+                            }
+                        }
+                    }
+            } catch (_: Exception) {
             }
         }
+        return byPackage.values.toList().also { cachedShareAppIcons = it }
     }
 
     private fun clickOriginalTarget(label: String) {
