@@ -323,7 +323,6 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            title = "SmartShare accessibility overlay"
         }
 
         try {
