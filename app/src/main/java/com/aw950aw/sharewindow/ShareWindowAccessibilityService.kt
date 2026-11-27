@@ -89,6 +89,8 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             eventClass.contains("NotificationShade", ignoreCase = true) ||
             eventClass.contains("StatusBar", ignoreCase = true)
         ) {
+            // Cancel a pending delayed hide from an adjacent window event.
+            handler.removeCallbacks(hideRunnable)
             return
         }
 
@@ -253,7 +255,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private fun hasClickableAncestor(node: AccessibilityNodeInfo): Boolean {
         var current: AccessibilityNodeInfo? = node
         var depth = 0
-        while (current != null && depth <= 7) {
+        while (current != null && depth <= 16) {
             if (current.isClickable) return true
             current = current.parent
             depth++
@@ -608,7 +610,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         if (nodeText == label || nodeDescription == label) {
             var current: AccessibilityNodeInfo? = node
             var steps = 0
-            while (current != null && steps <= 7) {
+            while (current != null && steps <= 16) {
                 if (current.isClickable && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                     return true
                 }
