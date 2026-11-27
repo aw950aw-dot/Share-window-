@@ -610,6 +610,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         val quickRow = overlayQuickShareContainer
         quickRow?.removeAllViews()
         if (!quickLabel.isNullOrBlank()) {
+            quickRow?.visibility = View.VISIBLE
             val pill = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
