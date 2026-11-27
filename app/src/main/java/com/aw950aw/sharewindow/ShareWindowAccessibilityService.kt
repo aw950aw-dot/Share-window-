@@ -83,6 +83,15 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             return
         }
 
+        // Opening Android's notification shade changes the active window to SystemUI.
+        // Keep the sharesheet overlay attached; when the shade closes it will be visible again.
+        if (eventPackage == "com.android.systemui" ||
+            eventClass.contains("NotificationShade", ignoreCase = true) ||
+            eventClass.contains("StatusBar", ignoreCase = true)
+        ) {
+            return
+        }
+
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             eventPackage.isNotBlank() &&
             eventPackage != "android" &&
@@ -264,7 +273,9 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         var list = overlayListContainer
         if (screen == null || list == null) {
             screen = FrameLayout(this).apply {
-                setBackgroundColor(Color.argb(105, 0, 0, 0))
+                // Fully black scrim: sliding the sheet down must never reveal
+                // the native Android chooser underneath it.
+                setBackgroundColor(Color.BLACK)
                 isClickable = true
                 isFocusable = false
                 setOnClickListener { closeChooser() }
@@ -277,10 +288,10 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
                 setPadding(dp(16), dp(7), dp(16), dp(14))
                 background = GradientDrawable().apply {
-                    setColor(Color.rgb(250, 251, 254))
+                    setColor(Color.rgb(249, 250, 253))
                     cornerRadii = floatArrayOf(
-                        dp(24).toFloat(), dp(24).toFloat(),
-                        dp(24).toFloat(), dp(24).toFloat(),
+                        dp(28).toFloat(), dp(28).toFloat(),
+                        dp(28).toFloat(), dp(28).toFloat(),
                         0f, 0f, 0f, 0f
                     )
                 }
@@ -295,9 +306,10 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             }
             val handle = View(this).apply {
                 background = GradientDrawable().apply {
-                    setColor(Color.rgb(185, 190, 199))
-                    cornerRadius = dp(3).toFloat()
+                    setColor(Color.rgb(165, 171, 181))
+                    cornerRadius = dp(4).toFloat()
                 }
+                contentDescription = "גרירת חלונית השיתוף"
             }
             dragArea.addView(handle, LinearLayout.LayoutParams(dp(38), dp(5)))
             sheet.addView(dragArea, LinearLayout.LayoutParams(-1, dp(28)))
@@ -478,7 +490,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                     layoutDirection = View.LAYOUT_DIRECTION_RTL
                     gravity = Gravity.TOP
                 }
-                list.addView(row, LinearLayout.LayoutParams(-1, dp(112)))
+                list.addView(row, LinearLayout.LayoutParams(-1, dp(120)))
             }
 
             val tile = LinearLayout(this).apply {
@@ -496,8 +508,14 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 val drawable = findShareAppIcon(label)
                     ?: getDrawable(android.R.drawable.sym_def_app_icon)
                 setImageDrawable(drawable)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.rgb(237, 240, 247))
+                }
+                elevation = dp(1).toFloat()
             }
-            tile.addView(icon, LinearLayout.LayoutParams(dp(46), dp(46)))
+            tile.addView(icon, LinearLayout.LayoutParams(dp(54), dp(54)))
 
             val caption = TextView(this).apply {
                 text = label
