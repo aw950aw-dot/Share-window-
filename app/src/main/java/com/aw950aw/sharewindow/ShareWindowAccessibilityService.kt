@@ -34,6 +34,12 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private var overlayPreviewView: TextView? = null
     private var overlayQuickShareContainer: LinearLayout? = null
     private var overlayDimView: View? = null
+    private var dimBoundsCaptured = false
+    private var chooserSourcePackage: String? = null
+    private var lastChooserEventAt = 0L
+    private var dismissedChooserEventTime = 0L
+    private var notificationShadeVisible = false
+    private var backSentForCurrentChooser = false
     private var cachedShareAppIcons: List<ShareAppIcon>? = null
     private var lastCandidates: List<String> = emptyList()
     private var lastPreviewSummary: String = ""
@@ -61,15 +67,36 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         if (event == null) return
         val eventClass = event.className?.toString().orEmpty()
         val eventPackage = event.packageName?.toString().orEmpty()
+        val now = SystemClock.elapsedRealtime()
+
+        // SystemUI owns the notification shade. Keep the current sheet and its
+        // accumulated targets intact while the shade is shown above the app.
+        if (eventPackage == "com.android.systemui" ||
+            eventClass.contains("NotificationShade", ignoreCase = true) ||
+            eventClass.contains("StatusBar", ignoreCase = true)
+        ) {
+            if (chooserExpected) notificationShadeVisible = true
+            handler.removeCallbacks(hideRunnable)
+            return
+        }
 
         if (eventClass.contains("ChooserActivity", ignoreCase = true)) {
-            if (SystemClock.elapsedRealtime() < suppressChooserUntil) return
+            // Ignore delayed ChooserActivity events from the sheet we just dismissed.
+            if (now < suppressChooserUntil || event.eventTime <= dismissedChooserEventTime) return
+
+            val isNewChooser = !chooserExpected
             chooserExpected = true
-            scanRetryCount = 0
-            accumulatedCandidates.clear()
-            lastCandidates = emptyList()
-            lastPreviewSummary = ""
-            quickShareCandidate = null
+            notificationShadeVisible = false
+            lastChooserEventAt = now
+            if (isNewChooser) {
+                scanRetryCount = 0
+                accumulatedCandidates.clear()
+                lastCandidates = emptyList()
+                lastPreviewSummary = ""
+                quickShareCandidate = null
+                backSentForCurrentChooser = false
+            }
+
             prefs.edit()
                 .putString("last_class", eventClass)
                 .putString("last_package", eventPackage)
@@ -78,51 +105,56 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             handler.removeCallbacks(hideRunnable)
             handler.removeCallbacks(scanRunnable)
 
-            // Cover the native chooser immediately, then inspect the tree to reject upload pickers.
-            val initialRoot = findChooserRoot()
-            val initialVerdict = initialRoot?.let { classifyShareChooser(it) }
-            if (initialVerdict != "file-picker" && prefs.getBoolean("overlay_enabled", true)) {
+            // Attach the cover immediately. File-picker classification runs after
+            // the cover exists, so the native chooser never gets a visible head start.
+            if (prefs.getBoolean("overlay_enabled", true) && overlayView == null) {
                 showOverlay(emptyList(), loading = true)
-            } else if (initialVerdict == "file-picker") {
-                chooserExpected = false
-                removeOverlay()
-                return
             }
 
-            handler.postDelayed(scanRunnable, 15)
-            return
-        }
+            val initialRoot = findChooserRoot()
+            if (initialRoot != null) {
+                updateDimLayerBounds(overlayView as? FrameLayout ?: return, initialRoot)
+                if (classifyShareChooser(initialRoot) == "file-picker") {
+                    chooserExpected = false
+                    removeOverlay()
+                    return
+                }
+            }
 
-        // Opening Android's notification shade changes the active window to SystemUI.
-        // Keep the sharesheet overlay attached; when the shade closes it will be visible again.
-        if (eventPackage == "com.android.systemui" ||
-            eventClass.contains("NotificationShade", ignoreCase = true) ||
-            eventClass.contains("StatusBar", ignoreCase = true)
-        ) {
-            // Cancel a pending delayed hide from an adjacent window event.
-            handler.removeCallbacks(hideRunnable)
+            handler.postDelayed(scanRunnable, if (isNewChooser) 0L else 25L)
             return
-        }
-
-        if (eventPackage.isNotBlank() &&
-            eventPackage != "android" &&
-            eventPackage != packageName &&
-            eventPackage != "com.android.systemui"
-        ) {
-            // Returning to the source app is the new chooser lifecycle boundary.
-            suppressChooserUntil = 0L
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             eventPackage.isNotBlank() &&
             eventPackage != "android" &&
-            eventPackage != packageName &&
-            eventPackage != "com.android.systemui"
+            eventPackage != packageName
         ) {
-            handler.removeCallbacks(scanRunnable)
-            handler.removeCallbacks(hideRunnable)
-            handler.postDelayed(hideRunnable, 350)
-        } else if (chooserExpected &&
+            if (chooserExpected) {
+                if (eventPackage == chooserSourcePackage) {
+                    // This is the source app reappearing (including closing the
+                    // notification shade). Keep SmartShare and its list attached.
+                    notificationShadeVisible = false
+                    handler.removeCallbacks(hideRunnable)
+                    return
+                }
+
+                // A different app became foreground: the user selected a recipient
+                // or left the chooser. Remove only our overlay; never send Back here.
+                chooserExpected = false
+                notificationShadeVisible = false
+                handler.removeCallbacks(scanRunnable)
+                handler.removeCallbacks(hideRunnable)
+                removeOverlay()
+                chooserSourcePackage = eventPackage
+                return
+            }
+
+            // Remember the app that launched the next ACTION_SEND chooser.
+            chooserSourcePackage = eventPackage
+        }
+
+        if (chooserExpected &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
             eventPackage == "android"
         ) {
@@ -408,7 +440,9 @@ class ShareWindowAccessibilityService : AccessibilityService() {
 
             // The dim layer is limited to the native chooser's actual bounds.
             val dim = View(this).apply {
-                setBackgroundColor(Color.argb(150, 0, 0, 0))
+                // Opaque white cover stays at the original native sharesheet bounds
+                // while the replacement sheet is dragged away from it.
+                setBackgroundColor(Color.WHITE)
                 isClickable = false
             }
             screen.addView(dim)
@@ -568,12 +602,19 @@ class ShareWindowAccessibilityService : AccessibilityService() {
 
     private fun updateDimLayerBounds(screen: FrameLayout, root: AccessibilityNodeInfo?) {
         val dim = overlayDimView ?: return
-        val bounds = root?.let { findNativeSheetBounds(it) } ?: Rect(
-            0,
-            (resources.displayMetrics.heightPixels * 0.38f).toInt(),
-            resources.displayMetrics.widthPixels,
-            resources.displayMetrics.heightPixels
-        )
+        if (dimBoundsCaptured) return
+
+        val bounds = if (root != null) {
+            findNativeSheetBounds(root).also { dimBoundsCaptured = true }
+        } else {
+            Rect(
+                0,
+                (resources.displayMetrics.heightPixels * 0.38f).toInt(),
+                resources.displayMetrics.widthPixels,
+                resources.displayMetrics.heightPixels
+            )
+        }
+
         val params = FrameLayout.LayoutParams(
             bounds.width().coerceAtLeast(1),
             bounds.height().coerceAtLeast(1)
@@ -584,7 +625,6 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         }
         dim.layoutParams = params
         dim.bringToFront()
-        // Put the sheet back above the dim region.
         if (screen.childCount > 1) screen.getChildAt(screen.childCount - 1).bringToFront()
     }
 
@@ -632,7 +672,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                     findShareAppIcon(quickLabel) ?: getDrawable(android.R.drawable.sym_def_app_icon)
                 )
             }
-            pill.addView(icon, LinearLayout.LayoutParams(dp(46), dp(46)))
+            pill.addView(icon, LinearLayout.LayoutParams(dp(60), dp(60)))
             val label = TextView(this).apply {
                 text = "Quick Share"
                 textSize = 15f
@@ -817,15 +857,28 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     }
 
     private fun closeChooser() {
-        val shouldGoBack = chooserExpected
-        suppressChooserUntil = SystemClock.elapsedRealtime() + 1800L
+        val now = SystemClock.elapsedRealtime()
+        val rootStillPresent = findChooserRoot() != null
+        val recentChooser = chooserExpected &&
+            lastChooserEventAt > 0L &&
+            now - lastChooserEventAt <= 3500L
+        val shouldGoBack = recentChooser && rootStillPresent &&
+            !notificationShadeVisible && !backSentForCurrentChooser
+
+        // Mark the current chooser dismissed before removing our view. This blocks
+        // queued accessibility events generated by the old chooser animation.
+        dismissedChooserEventTime = SystemClock.uptimeMillis()
+        suppressChooserUntil = now + 5000L
         chooserExpected = false
+        notificationShadeVisible = false
+        backSentForCurrentChooser = true
         handler.removeCallbacks(scanRunnable)
         handler.removeCallbacks(hideRunnable)
         removeOverlay()
+
+        // Exactly one Back, and only while the native chooser is still verifiably
+        // present. Never send a second Back after the source app has returned.
         if (shouldGoBack) {
-            // The accessibility overlay is not the native chooser activity.
-            // Send Back after removing our window so Android dismisses the chooser too.
             performGlobalAction(GLOBAL_ACTION_BACK)
         }
     }
@@ -842,6 +895,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         overlayPreviewView = null
         overlayQuickShareContainer = null
         overlayDimView = null
+        dimBoundsCaptured = false
     }
 
     private fun dp(value: Int): Int =
