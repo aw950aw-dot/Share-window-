@@ -40,6 +40,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private var quickShareCandidate: String? = null
     private val accumulatedCandidates = LinkedHashSet<String>()
     private var scanRetryCount = 0
+    private var showHiddenList = false
     private var suppressChooserUntil = 0L
     private data class ShareAppIcon(val label: String, val packageName: String, val drawable: Drawable)
 
