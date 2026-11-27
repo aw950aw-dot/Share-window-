@@ -31,12 +31,17 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private var overlayView: View? = null
     private var overlayListContainer: LinearLayout? = null
     private var overlaySubtitleView: TextView? = null
+    private var overlayPreviewView: TextView? = null
+    private var overlayQuickShareContainer: LinearLayout? = null
+    private var overlayDimView: View? = null
     private var cachedShareAppIcons: List<ShareAppIcon>? = null
     private var lastCandidates: List<String> = emptyList()
+    private var lastPreviewSummary: String = ""
+    private var quickShareCandidate: String? = null
+    private val accumulatedCandidates = LinkedHashSet<String>()
+    private var scanRetryCount = 0
+    private var suppressChooserUntil = 0L
     private data class ShareAppIcon(val label: String, val packageName: String, val drawable: Drawable)
-    private var showHiddenList = false
-    private var secretPresses = 0
-    private var lastSecretPressAt = 0L
 
     private val scanRunnable = Runnable { scanChooserAndShow() }
     private val hideRunnable = Runnable {
@@ -57,7 +62,13 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         val eventPackage = event.packageName?.toString().orEmpty()
 
         if (eventClass.contains("ChooserActivity", ignoreCase = true)) {
+            if (SystemClock.elapsedRealtime() < suppressChooserUntil) return
             chooserExpected = true
+            scanRetryCount = 0
+            accumulatedCandidates.clear()
+            lastCandidates = emptyList()
+            lastPreviewSummary = ""
+            quickShareCandidate = null
             prefs.edit()
                 .putString("last_class", eventClass)
                 .putString("last_package", eventPackage)
@@ -66,19 +77,17 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             handler.removeCallbacks(hideRunnable)
             handler.removeCallbacks(scanRunnable)
 
-            // Do not cover file-upload pickers: first inspect the chooser's visible content.
+            // Cover the native chooser immediately, then inspect the tree to reject upload pickers.
             val initialRoot = findChooserRoot()
             val initialVerdict = initialRoot?.let { classifyShareChooser(it) }
             if (initialVerdict != "file-picker" && prefs.getBoolean("overlay_enabled", true)) {
-                // ChooserActivity is the strong signal for ACTION_SEND. Cover immediately,
-                // without waiting for the text tree to finish rendering.
                 showOverlay(emptyList(), loading = true)
-            } else {
+            } else if (initialVerdict == "file-picker") {
                 chooserExpected = false
                 removeOverlay()
+                return
             }
 
-            // Build the target list only after the native chooser has been covered.
             handler.postDelayed(scanRunnable, 15)
             return
         }
@@ -94,10 +103,20 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             return
         }
 
+        if (eventPackage.isNotBlank() &&
+            eventPackage != "android" &&
+            eventPackage != packageName &&
+            eventPackage != "com.android.systemui"
+        ) {
+            // Returning to the source app is the new chooser lifecycle boundary.
+            suppressChooserUntil = 0L
+        }
+
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             eventPackage.isNotBlank() &&
             eventPackage != "android" &&
-            eventPackage != packageName
+            eventPackage != packageName &&
+            eventPackage != "com.android.systemui"
         ) {
             handler.removeCallbacks(scanRunnable)
             handler.removeCallbacks(hideRunnable)
@@ -125,20 +144,16 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         if (!chooserExpected) return
         val root = findChooserRoot()
         if (root == null) {
-            prefs.edit().putString(
-                "last_tree",
-                "ChooserActivity זוהתה, אך שירות הנגישות עדיין לא קיבל עץ חלון. הבדיקה תנסה שוב באירוע התוכן הבא."
-            ).apply()
+            scheduleAnotherScan()
             return
         }
 
-        val verdict = classifyShareChooser(root)
-        if (verdict == "file-picker") {
+        if (classifyShareChooser(root) == "file-picker") {
             chooserExpected = false
             removeOverlay()
             prefs.edit().putString(
                 "last_tree",
-                "החלון זוהה כמסך בחירת קובץ/העלאה; SmartShare לא הוצגה."
+                "החלון זוהה כמסך בחירת קובץ/העלאה; חלונית השיתוף לא הוצגה."
             ).apply()
             return
         }
@@ -148,7 +163,11 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         val counter = intArrayOf(0)
         collectTree(root, 0, treeLines, candidates, counter)
 
-        lastCandidates = candidates.toList()
+        accumulatedCandidates.addAll(candidates)
+        lastCandidates = accumulatedCandidates.toList()
+        lastPreviewSummary = findSharedContentSummary(root, lastCandidates)
+        quickShareCandidate = lastCandidates.firstOrNull { isQuickShareLabel(it) }
+
         prefs.edit()
             .putStringSet("last_candidates", lastCandidates.toSet())
             .putString(
@@ -163,6 +182,113 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         } else {
             removeOverlay()
         }
+
+        // Android populates some OEM chooser targets after the first frame.
+        // Keep collecting incremental rows for a short period instead of freezing a partial list.
+        if (lastCandidates.size < 10) scheduleAnotherScan()
+    }
+
+    private fun scheduleAnotherScan() {
+        if (!chooserExpected || scanRetryCount >= 7) return
+        val delays = longArrayOf(70, 120, 180, 260, 380, 550, 750)
+        val delay = delays[scanRetryCount.coerceIn(0, delays.lastIndex)]
+        scanRetryCount++
+        handler.removeCallbacks(scanRunnable)
+        handler.postDelayed(scanRunnable, delay)
+    }
+
+    private fun isQuickShareLabel(label: String): Boolean {
+        val value = label.lowercase(java.util.Locale.ROOT)
+        return value.contains("quick share") ||
+            value.contains("nearby share") ||
+            value.contains("שיתוף מהיר") ||
+            value.contains("שיתוף בקרבת מקום")
+    }
+
+    private fun findSharedContentSummary(
+        root: AccessibilityNodeInfo,
+        targetLabels: List<String>
+    ): String {
+        val candidates = ArrayList<Pair<Int, String>>()
+        val screenHeight = resources.displayMetrics.heightPixels
+        val targetSet = targetLabels.map { it.lowercase(java.util.Locale.ROOT) }.toSet()
+        var visited = 0
+
+        fun walk(node: AccessibilityNodeInfo, depth: Int) {
+            if (visited >= 700 || depth > 28) return
+            visited++
+            if (node.isVisibleToUser) {
+                val raw = node.text?.toString()?.trim().orEmpty()
+                    .ifBlank { node.contentDescription?.toString()?.trim().orEmpty() }
+                val value = raw.replace("\\n", " ").trim()
+                val lower = value.lowercase(java.util.Locale.ROOT)
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                val generic = listOf(
+                    "share", "sharing", "share with", "send to", "quick share",
+                    "nearby share", "שיתוף", "שתף", "שיתוף מהיר", "שליחה", "שלח אל"
+                )
+                if (value.length in 2..140 &&
+                    lower !in targetSet &&
+                    generic.none { lower == it } &&
+                    !hasClickableAncestor(node) &&
+                    bounds.top < (screenHeight * 0.68f).toInt()
+                ) {
+                    candidates.add(bounds.top to value)
+                }
+            }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                walk(child, depth + 1)
+            }
+        }
+        walk(root, 0)
+        return candidates.sortedBy { it.first }.firstOrNull()?.second.orEmpty()
+    }
+
+    private fun findNativeSheetBounds(root: AccessibilityNodeInfo): Rect {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        var best: Rect? = null
+        var bestScore = Double.MAX_VALUE
+        var visited = 0
+
+        fun walk(node: AccessibilityNodeInfo, depth: Int) {
+            if (visited >= 900 || depth > 30) return
+            visited++
+            if (node.isVisibleToUser) {
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                val widthRatio = rect.width().toFloat() / screenWidth.coerceAtLeast(1)
+                val heightRatio = rect.height().toFloat() / screenHeight.coerceAtLeast(1)
+                if (widthRatio >= 0.78f &&
+                    heightRatio in 0.22f..0.88f &&
+                    rect.top >= (screenHeight * 0.10f).toInt() &&
+                    rect.bottom >= (screenHeight * 0.58f).toInt() &&
+                    rect.bottom <= screenHeight + dp(30)
+                ) {
+                    val score = kotlin.math.abs(heightRatio - 0.48f) +
+                        kotlin.math.abs(widthRatio - 1.0f) * 0.5 +
+                        kotlin.math.abs(rect.bottom - screenHeight) / screenHeight.toDouble() * 0.25
+                    if (score < bestScore) {
+                        bestScore = score
+                        best = Rect(rect)
+                    }
+                }
+            }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                walk(child, depth + 1)
+            }
+        }
+        walk(root, 0)
+
+        return best ?: Rect(
+            0,
+            (screenHeight * 0.38f).toInt(),
+            screenWidth,
+            screenHeight
+        )
     }
 
     /**
@@ -227,7 +353,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         candidates: MutableSet<String>,
         counter: IntArray
     ) {
-        if (counter[0] >= 320 || depth > 22) return
+        if (counter[0] >= 1400 || depth > 30) return
         counter[0]++
         val text = node.text?.toString().orEmpty().replace("\n", " ").trim()
         val description = node.contentDescription?.toString().orEmpty().replace("\n", " ").trim()
@@ -248,7 +374,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
             collectTree(child, depth + 1, lines, candidates, counter)
-            if (counter[0] >= 320) break
+            if (counter[0] >= 1400) break
         }
     }
 
@@ -270,25 +396,30 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     ) {
         lastCandidates = candidates
 
-        // Keep one attached accessibility window to prevent the native chooser flashing through.
         var screen = overlayView as? FrameLayout
         var list = overlayListContainer
         if (screen == null || list == null) {
             screen = FrameLayout(this).apply {
-                // Fully black scrim: sliding the sheet down must never reveal
-                // the native Android chooser underneath it.
-                setBackgroundColor(Color.BLACK)
+                setBackgroundColor(Color.TRANSPARENT)
                 isClickable = true
                 isFocusable = false
-                setOnClickListener { closeChooser() }
             }
 
-            val sheetHeight = (resources.displayMetrics.heightPixels - dp(20)).coerceAtLeast(dp(420))
-            val peekHeight = (resources.displayMetrics.heightPixels * 0.70f).toInt().coerceAtMost(sheetHeight)
+            // The dim layer is limited to the native chooser's actual bounds.
+            val dim = View(this).apply {
+                setBackgroundColor(Color.argb(150, 0, 0, 0))
+                isClickable = false
+            }
+            screen.addView(dim)
+            overlayDimView = dim
+            updateDimLayerBounds(screen, findChooserRoot())
+
+            val sheetHeight = (resources.displayMetrics.heightPixels - dp(12)).coerceAtLeast(dp(420))
+            val peekHeight = (resources.displayMetrics.heightPixels * 0.68f).toInt().coerceAtMost(sheetHeight)
             val sheet = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
-                setPadding(dp(16), dp(7), dp(16), dp(14))
+                setPadding(dp(17), dp(7), dp(17), dp(15))
                 background = GradientDrawable().apply {
                     setColor(Color.rgb(249, 250, 253))
                     cornerRadii = floatArrayOf(
@@ -297,7 +428,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                         0f, 0f, 0f, 0f
                     )
                 }
-                elevation = dp(16).toFloat()
+                elevation = dp(18).toFloat()
             }
 
             val dragArea = LinearLayout(this).apply {
@@ -308,55 +439,45 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             }
             val handle = View(this).apply {
                 background = GradientDrawable().apply {
-                    setColor(Color.rgb(165, 171, 181))
+                    setColor(Color.rgb(175, 180, 190))
                     cornerRadius = dp(4).toFloat()
                 }
                 contentDescription = "גרירת חלונית השיתוף"
             }
             dragArea.addView(handle, LinearLayout.LayoutParams(dp(38), dp(5)))
-            sheet.addView(dragArea, LinearLayout.LayoutParams(-1, dp(28)))
+            sheet.addView(dragArea, LinearLayout.LayoutParams(-1, dp(24)))
 
-            val topRow = LinearLayout(this).apply {
+            // Preview header: display the shared filename/description when Android exposes it.
+            val preview = TextView(this).apply {
+                textSize = 15f
+                setTextColor(Color.rgb(42, 49, 63))
+                setTypeface(typeface, Typeface.BOLD)
+                gravity = Gravity.CENTER_VERTICAL
+                maxLines = 2
+                setPadding(dp(3), dp(3), dp(3), dp(9))
+            }
+            overlayPreviewView = preview
+            sheet.addView(preview)
+
+            // The Quick Share destination is featured above the regular app grid.
+            val quickRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(0, dp(2), 0, dp(10))
             }
-            val title = TextView(this).apply {
-                text = "SmartShare"
-                textSize = 21f
-                setTextColor(Color.rgb(27, 42, 69))
-                setTypeface(typeface, Typeface.BOLD)
-                gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
-                setOnLongClickListener {
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastSecretPressAt > 10_000L) secretPresses = 0
-                    lastSecretPressAt = now
-                    secretPresses++
-                    if (secretPresses >= 4) {
-                        secretPresses = 0
-                        showHiddenList = !showHiddenList
-                        renderOverlayContents(lastCandidates, false, false)
-                    }
-                    true
-                }
-            }
-            topRow.addView(title, LinearLayout.LayoutParams(0, dp(48), 1f))
+            overlayQuickShareContainer = quickRow
+            sheet.addView(quickRow)
 
-            val close = TextView(this).apply {
-                text = "✕"
-                textSize = 22f
-                setTextColor(Color.DKGRAY)
-                gravity = Gravity.CENTER
-                setPadding(dp(12), 0, dp(4), 0)
-                setOnClickListener { closeChooser() }
+            val divider = View(this).apply {
+                setBackgroundColor(Color.rgb(231, 234, 240))
             }
-            topRow.addView(close, LinearLayout.LayoutParams(dp(42), dp(48)))
-            sheet.addView(topRow)
+            sheet.addView(divider, LinearLayout.LayoutParams(-1, dp(1)))
 
             val subtitle = TextView(this).apply {
-                textSize = 13f
-                setTextColor(Color.rgb(95, 104, 120))
-                setPadding(dp(2), 0, dp(2), dp(9))
+                textSize = 12f
+                setTextColor(Color.rgb(100, 108, 122))
+                setPadding(dp(2), dp(9), dp(2), dp(5))
             }
             overlaySubtitleView = subtitle
             sheet.addView(subtitle)
@@ -384,26 +505,23 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                     }
                     android.view.MotionEvent.ACTION_MOVE -> {
                         val dy = event.rawY - downY
-                        val maxDrag = sheetHeight.toFloat()
-                        sheet.translationY = (startTranslation + dy).coerceIn(0f, maxDrag)
+                        sheet.translationY = (startTranslation + dy).coerceIn(0f, sheetHeight.toFloat())
                         true
                     }
                     android.view.MotionEvent.ACTION_UP,
                     android.view.MotionEvent.ACTION_CANCEL -> {
                         val dy = event.rawY - downY
-                        val dismissAt = (sheetHeight * 0.78f)
-                        val movedDownFar = sheet.translationY >= dismissAt
+                        val movedDownFar = sheet.translationY >= (sheetHeight * 0.78f)
                         when {
                             movedDownFar -> closeChooser()
-                            dy < -dp(65) -> sheet.animate().translationY(0f).setDuration(180).start()
-                            dy > dp(65) && sheet.translationY > (sheetHeight - peekHeight + dp(100)) ->
+                            dy < -dp(65) ->
+                                sheet.animate().translationY(0f).setDuration(180).start()
+                            dy > dp(65) &&
+                                sheet.translationY > (sheetHeight - peekHeight + dp(100)) ->
                                 closeChooser()
                             else -> {
-                                val target = if (sheet.translationY < (sheetHeight - peekHeight) / 2f) {
-                                    0f
-                                } else {
-                                    (sheetHeight - peekHeight).toFloat()
-                                }
+                                val collapsed = (sheetHeight - peekHeight).toFloat()
+                                val target = if (sheet.translationY < collapsed / 2f) 0f else collapsed
                                 sheet.animate().translationY(target).setDuration(180).start()
                             }
                         }
@@ -436,11 +554,37 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 overlayView = null
                 overlayListContainer = null
                 overlaySubtitleView = null
+                overlayPreviewView = null
+                overlayQuickShareContainer = null
+                overlayDimView = null
                 return
             }
         }
 
+        updateDimLayerBounds(screen, findChooserRoot())
         renderOverlayContents(candidates, loading, unavailable)
+    }
+
+    private fun updateDimLayerBounds(screen: FrameLayout, root: AccessibilityNodeInfo?) {
+        val dim = overlayDimView ?: return
+        val bounds = root?.let { findNativeSheetBounds(it) } ?: Rect(
+            0,
+            (resources.displayMetrics.heightPixels * 0.38f).toInt(),
+            resources.displayMetrics.widthPixels,
+            resources.displayMetrics.heightPixels
+        )
+        val params = FrameLayout.LayoutParams(
+            bounds.width().coerceAtLeast(1),
+            bounds.height().coerceAtLeast(1)
+        ).apply {
+            leftMargin = bounds.left
+            topMargin = bounds.top
+            gravity = Gravity.TOP or Gravity.START
+        }
+        dim.layoutParams = params
+        dim.bringToFront()
+        // Put the sheet back above the dim region.
+        if (screen.childCount > 1) screen.getChildAt(screen.childCount - 1).bringToFront()
     }
 
     private fun renderOverlayContents(
@@ -457,21 +601,65 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             candidates
         }
 
+        val previewText = lastPreviewSummary.ifBlank {
+            if (loading) "מכין תצוגה מקדימה של התוכן המשותף…" else "התוכן שבחרת לשתף"
+        }
+        overlayPreviewView?.text = previewText
+
+        val quickLabel = quickShareCandidate
+        val quickRow = overlayQuickShareContainer
+        quickRow?.removeAllViews()
+        if (!quickLabel.isNullOrBlank()) {
+            val pill = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(7), dp(14), dp(7))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(239, 244, 255))
+                    cornerRadius = dp(24).toFloat()
+                    setStroke(dp(1), Color.rgb(218, 228, 250))
+                }
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { clickOriginalTarget(quickLabel) }
+            }
+            val icon = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageDrawable(
+                    findShareAppIcon(quickLabel) ?: getDrawable(android.R.drawable.sym_def_app_icon)
+                )
+            }
+            pill.addView(icon, LinearLayout.LayoutParams(dp(46), dp(46)))
+            val label = TextView(this).apply {
+                text = "Quick Share"
+                textSize = 15f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(Color.rgb(32, 55, 96))
+                setPadding(dp(10), 0, dp(5), 0)
+            }
+            pill.addView(label)
+            quickRow?.addView(pill, LinearLayout.LayoutParams(-1, dp(60)))
+        } else {
+            // No explicit Quick Share entry was exposed by this device's chooser tree.
+            // Do not create a fake, non-working action.
+            quickRow?.visibility = View.GONE
+        }
+
         overlaySubtitleView?.text = when {
-            showHiddenList -> "מצב נסתר — כל הפריטים שזוהו"
-            filterEnabled -> "הרשימה המצומצמת שלך"
-            else -> "הפריטים שנמצאו בחלון השיתוף"
+            loading -> " "
+            filterEnabled -> "יישומים"
+            else -> "שיתוף באמצעות"
         }
 
         list.removeAllViews()
-        if (visibleCandidates.isEmpty()) {
+        val appCandidates = visibleCandidates.filterNot { isQuickShareLabel(it) }
+        if (appCandidates.isEmpty()) {
             val empty = TextView(this).apply {
                 text = when {
-                    loading -> "מכין את רשימת יעדי השיתוף…"
-                    unavailable -> "חלון השיתוף זוהה, אך כרגע Android לא מאפשר לקרוא את רשימת היעדים."
-                    filterEnabled && !showHiddenList ->
-                        "לא סומנו יעדים להצגה. אפשר לבחור יעדים במסך ההגדרות או לבצע ארבע לחיצות ארוכות על הכותרת כדי לחשוף את הרשימה המלאה."
-                    else -> "לא זוהו פריטים לחיצים בחלון. חזור למסך האבחון ובדוק את עץ הנגישות."
+                    loading -> "טוען יישומים זמינים לשיתוף…"
+                    unavailable -> "Android עדיין לא חשף את יעדי השיתוף."
+                    else -> "לא נמצאו יעדים נוספים בחלון השיתוף."
                 }
                 textSize = 14f
                 setTextColor(Color.DKGRAY)
@@ -482,17 +670,15 @@ class ShareWindowAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Native Android sharesheet presents app targets in icon tiles. Preserve
-        // their accessibility-tree order and render four columns per row.
         var row: LinearLayout? = null
-        visibleCandidates.forEachIndexed { index, label ->
+        appCandidates.forEachIndexed { index, label ->
             if (index % 4 == 0) {
                 row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     layoutDirection = View.LAYOUT_DIRECTION_RTL
                     gravity = Gravity.TOP
                 }
-                list.addView(row, LinearLayout.LayoutParams(-1, dp(120)))
+                list.addView(row, LinearLayout.LayoutParams(-1, dp(116)))
             }
 
             val tile = LinearLayout(this).apply {
@@ -501,23 +687,19 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 layoutDirection = View.LAYOUT_DIRECTION_LTR
                 isClickable = true
                 isFocusable = true
-                setPadding(dp(3), dp(4), dp(3), dp(4))
+                setPadding(dp(3), dp(3), dp(3), dp(3))
                 setOnClickListener { clickOriginalTarget(label) }
             }
-
             val icon = ImageView(this).apply {
                 scaleType = ImageView.ScaleType.FIT_CENTER
-                val drawable = findShareAppIcon(label)
-                    ?: getDrawable(android.R.drawable.sym_def_app_icon)
-                setImageDrawable(drawable)
-                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setImageDrawable(findShareAppIcon(label) ?: getDrawable(android.R.drawable.sym_def_app_icon))
+                setPadding(dp(9), dp(9), dp(9), dp(9))
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
                     setColor(Color.rgb(237, 240, 247))
                 }
-                elevation = dp(1).toFloat()
             }
-            tile.addView(icon, LinearLayout.LayoutParams(dp(54), dp(54)))
+            tile.addView(icon, LinearLayout.LayoutParams(dp(52), dp(52)))
 
             val caption = TextView(this).apply {
                 text = label
@@ -528,8 +710,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
                 setPadding(0, dp(4), 0, 0)
             }
             tile.addView(caption, LinearLayout.LayoutParams(-1, dp(36)))
-
-            row?.addView(tile, LinearLayout.LayoutParams(0, dp(104), 1f))
+            row?.addView(tile, LinearLayout.LayoutParams(0, dp(108), 1f))
         }
     }
 
@@ -551,33 +732,39 @@ class ShareWindowAccessibilityService : AccessibilityService() {
     private fun getShareAppIcons(): List<ShareAppIcon> {
         cachedShareAppIcons?.let { return it }
         val byPackage = LinkedHashMap<String, ShareAppIcon>()
-        val intents = listOf(
-            Intent(Intent.ACTION_SEND).apply { type = "*/*" },
-            Intent(Intent.ACTION_SEND_MULTIPLE).apply { type = "*/*" }
+        val mimeTypes = listOf(
+            "*/*", "text/plain", "image/*", "image/jpeg", "image/png",
+            "video/*", "video/mp4", "audio/*", "application/pdf",
+            "application/zip"
         )
-        intents.forEach { intent ->
-            try {
-                packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                    .forEach { info ->
-                        val activityInfo = info.activityInfo
-                        if (activityInfo != null) {
-                            val packageName = activityInfo.packageName
-                            if (!byPackage.containsKey(packageName)) {
-                                val appLabel = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
-                                if (appLabel.isNotEmpty()) {
-                                    val icon = try {
-                                        info.loadIcon(packageManager)
-                                    } catch (_: Exception) {
-                                        null
-                                    }
-                                    if (icon != null) {
-                                        byPackage[packageName] = ShareAppIcon(appLabel, packageName, icon)
+        val actions = listOf(Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE)
+        actions.forEach { action ->
+            mimeTypes.forEach { mime ->
+                try {
+                    val intent = Intent(action).apply { type = mime }
+                    packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+                        .forEach { info ->
+                            val activityInfo = info.activityInfo
+                            if (activityInfo != null) {
+                                val packageName = activityInfo.packageName
+                                if (!byPackage.containsKey(packageName)) {
+                                    val appLabel = info.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+                                    if (appLabel.isNotEmpty()) {
+                                        val icon = try {
+                                            info.loadIcon(packageManager)
+                                        } catch (_: Exception) {
+                                            null
+                                        }
+                                        if (icon != null) {
+                                            byPackage[packageName] =
+                                                ShareAppIcon(appLabel, packageName, icon)
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-            } catch (_: Exception) {
+                } catch (_: Exception) {
+                }
             }
         }
         return byPackage.values.toList().also { cachedShareAppIcons = it }
@@ -629,6 +816,7 @@ class ShareWindowAccessibilityService : AccessibilityService() {
 
     private fun closeChooser() {
         val shouldGoBack = chooserExpected
+        suppressChooserUntil = SystemClock.elapsedRealtime() + 1800L
         chooserExpected = false
         handler.removeCallbacks(scanRunnable)
         handler.removeCallbacks(hideRunnable)
@@ -649,6 +837,9 @@ class ShareWindowAccessibilityService : AccessibilityService() {
         overlayView = null
         overlayListContainer = null
         overlaySubtitleView = null
+        overlayPreviewView = null
+        overlayQuickShareContainer = null
+        overlayDimView = null
     }
 
     private fun dp(value: Int): Int =
